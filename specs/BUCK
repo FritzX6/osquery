@@ -522,7 +522,7 @@ osquery_gentable_cxx_library(
         ),
         (
             "posix/firefox_addons.table",
-            "linux,macos,freebsd",
+            "linux,macos,freebsd,windows",
         ),
         (
             "posix/hardware_events.table",
