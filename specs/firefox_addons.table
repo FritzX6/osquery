@@ -1,5 +1,5 @@
 table_name("firefox_addons")
-description("Firefox browser extensions, webapps, and addons.")
+description("Firefox (and Firefox-fork, e.g. Zen, Floorp, LibreWolf, Waterfox) browser extensions, webapps, and addons.")
 schema([
     Column("uid", BIGINT, "The local user that owns the addon", additional=True, optimized=True),
     Column("name", TEXT, "Addon display name"),

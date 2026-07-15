@@ -29,8 +29,14 @@ namespace {
 
 /// Each home directory will include custom extensions.
 #if defined(__APPLE__)
+// Firefox and its forks share the same profile/extensions.json layout, so we
+// scan each fork's application-support directory in addition to Firefox itself.
 const std::vector<std::string> kFirefoxPaths = {
-    "/Library/Application Support/Firefox/Profiles/"};
+    "/Library/Application Support/Firefox/Profiles/",
+    "/Library/Application Support/zen/Profiles/",
+    "/Library/Application Support/Floorp/Profiles/",
+    "/Library/Application Support/librewolf/Profiles/",
+    "/Library/Application Support/Waterfox/Profiles/"};
 #elif defined(__linux__)
 // Firefox 147 added support for the XDG Base Directory Specification:
 // new profiles are created under $XDG_CONFIG_HOME/mozilla/firefox/
@@ -40,10 +46,23 @@ const std::vector<std::string> kFirefoxPaths = {
 const std::vector<std::string> kFirefoxPaths = {
     "/.mozilla/firefox/",
     "/snap/firefox/common/.mozilla/firefox/",
-    "/.config/mozilla/firefox/"};
+    "/.config/mozilla/firefox/",
+    // Firefox forks share the same profile/extensions.json layout
+    "/.zen/",
+    "/.var/app/app.zen_browser.zen/.zen/",
+    "/.floorp/",
+    "/.var/app/one.ablaze.floorp/.floorp/",
+    "/.librewolf/",
+    "/.var/app/io.gitlab.librewolf-community/.librewolf/",
+    "/.waterfox/"};
 #elif defined(WIN32)
 const std::vector<std::string> kFirefoxPaths = {
-    "\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles"};
+    "\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles",
+    // Firefox forks share the same profile/extensions.json layout
+    "\\AppData\\Roaming\\zen\\Profiles",
+    "\\AppData\\Roaming\\Floorp\\Profiles",
+    "\\AppData\\Roaming\\librewolf\\Profiles",
+    "\\AppData\\Roaming\\Waterfox\\Profiles"};
 #endif
 
 #define kFirefoxExtensionsFile "/extensions.json"
