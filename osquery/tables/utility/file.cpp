@@ -267,6 +267,7 @@ std::set<std::string> getDirsFromConstraints(const QueryContext& context) {
 void genFileInfoWindows(const fs::path& path,
                         const fs::path& parent,
                         const std::string& pattern,
+                        const WindowsStatFields& stat_fields,
                         bool get_shortcut_data,
                         QueryData& results) {
   // Must provide the path, filename, directory separate from boost path->string
@@ -279,7 +280,7 @@ void genFileInfoWindows(const fs::path& path,
 
   WINDOWS_STAT file_stat;
 
-  auto rtn = platformStat(path, &file_stat);
+  auto rtn = platformStat(path, &file_stat, stat_fields);
   if (!rtn.ok()) {
     VLOG(1) << "PlatformStat failed with " << rtn.getMessage();
     return;
@@ -337,11 +338,20 @@ QueryData genFileWindows(QueryContext& context, Logger& logger) {
                                                     "shortcut_run",
                                                     "shortcut_comment"});
 
+  // Only do the per-file work that the requested columns need
+  WindowsStatFields stat_fields;
+  stat_fields.handle_info = context.isAnyColumnUsed(
+      {"inode", "file_id", "ctime", "hard_links", "device", "volume_serial"});
+  stat_fields.owner = context.isAnyColumnUsed({"uid", "gid"});
+  stat_fields.block_size = context.isColumnUsed("block_size");
+  stat_fields.version_info = context.isAnyColumnUsed(
+      {"product_version", "file_version", "original_filename"});
+
   // Iterate through each of the resolved/supplied paths.
   for (const auto& path_string : paths) {
     fs::path path = path_string;
     genFileInfoWindows(
-        path, path.parent_path(), "", get_shortcut_data, results);
+        path, path.parent_path(), "", stat_fields, get_shortcut_data, results);
   }
 
   // Resolve directories for EQUALS and LIKE operations.
@@ -357,8 +367,12 @@ QueryData genFileWindows(QueryContext& context, Logger& logger) {
       // Iterate over the directory and generate info for each regular file.
       fs::directory_iterator begin(directory_string), end;
       for (; begin != end; ++begin) {
-        genFileInfoWindows(
-            begin->path(), directory_string, "", get_shortcut_data, results);
+        genFileInfoWindows(begin->path(),
+                           directory_string,
+                           "",
+                           stat_fields,
+                           get_shortcut_data,
+                           results);
       }
     } catch (const fs::filesystem_error& /* e */) {
       continue;

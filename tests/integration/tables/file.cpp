@@ -262,6 +262,59 @@ TEST_F(FileTests, test_sanity_directory) {
   test_sanity_common(data, directory, path_constraint);
 }
 
+TEST_F(FileTests, test_column_subsets_match_all_columns) {
+  // The table skips per-file work for columns a query doesn't use. Every
+  // subset of columns must still return the same values as select *.
+  std::vector<std::string> column_sets = {
+      "path, mtime",
+      "path, size, atime, mtime, btime, type, symlink, mode",
+      "path, filename, directory, uid, gid",
+      "path, inode, ctime, hard_links, device",
+      "path, block_size",
+  };
+
+#ifdef WIN32
+  column_sets.push_back("path, attributes, type");
+  column_sets.push_back("path, mtime, uid");
+  column_sets.push_back("path, file_id, volume_serial");
+  column_sets.push_back("path, product_version, file_version");
+  column_sets.push_back("path, original_filename");
+#endif
+
+  std::vector<std::string> constraints = {
+      "path like \"" + (directory / "%").string() + "\"",
+      "directory = \"" + directory.string() + "\"",
+  };
+
+  for (const auto& constraint : constraints) {
+    auto all_columns = execute_query("select * from file where " + constraint);
+    ASSERT_FALSE(all_columns.empty()) << constraint;
+
+    std::map<std::string, Row> rows_by_path;
+    for (const auto& row : all_columns) {
+      rows_by_path[row.at("path")] = row;
+    }
+
+    for (const auto& columns : column_sets) {
+      auto subset =
+          execute_query("select " + columns + " from file where " + constraint);
+      EXPECT_EQ(subset.size(), all_columns.size()) << columns;
+
+      for (const auto& row : subset) {
+        auto it = rows_by_path.find(row.at("path"));
+        ASSERT_NE(it, rows_by_path.end()) << row.at("path");
+
+        for (const auto& column : row) {
+          EXPECT_EQ(column.second, it->second.at(column.first))
+              << "column " << column.first << " of " << row.at("path")
+              << " differs when selecting " << columns << " where "
+              << constraint;
+        }
+      }
+    }
+  }
+}
+
 TEST_F(FileTests, test_nested_directory_traversal) {
   // Create nested directory structure:
   // 1/a.txt

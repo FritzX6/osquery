@@ -371,7 +371,12 @@ void genMsixPrograms(const std::string& key,
     // ::Warning:: not all filesystems support btime
     // Older file systems such as ext3 or FAT32 will have this missing
     WINDOWS_STAT file_stat;
-    auto rtn = platformStat(filePath.c_str(), &file_stat);
+    WindowsStatFields btime_only;
+    btime_only.handle_info = false;
+    btime_only.owner = false;
+    btime_only.block_size = false;
+    btime_only.version_info = false;
+    auto rtn = platformStat(filePath.c_str(), &file_stat, btime_only);
     if (rtn.ok()) {
       result["install_date"] = formatTimestampToDate(file_stat.btime);
     }
