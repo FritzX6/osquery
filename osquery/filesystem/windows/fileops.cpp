@@ -128,6 +128,9 @@ Status windowsGetVersionInfo(const std::string& path,
   DWORD handle = 0;
   std::wstring wpath = stringToWstring(path);
   auto verSize = GetFileVersionInfoSizeW(wpath.c_str(), &handle);
+  if (verSize == 0) {
+    return Status(GetLastError(), "Failed to get file version info size");
+  }
   auto verInfo = std::make_unique<BYTE[]>(verSize);
   if (verInfo == nullptr) {
     return Status(1, "Failed to malloc for version info");
@@ -1847,23 +1850,75 @@ std::string getFileAttribStr(unsigned long file_attributes) {
   return attribs;
 }
 
-Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
+namespace {
+
+// Paths in the Win32 device namespace (\\.\pipe\name, \\.\PhysicalDrive0) are
+// not plain files or directories, so their type has to come from a handle.
+bool isDevicePath(const std::wstring& path) {
+  return path.rfind(LR"(\\.\)", 0) == 0;
+}
+
+// Sets type and symlink for a file whose GetFileType() is FILE_TYPE_DISK.
+void setDiskFileType(DWORD attributes, WINDOWS_STAT* wfile_stat) {
+  if ((attributes & FILE_ATTRIBUTE_ARCHIVE) ||
+      (attributes & FILE_ATTRIBUTE_NORMAL)) {
+    wfile_stat->type = "regular";
+  } else if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+    wfile_stat->type = "directory";
+  } else if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    wfile_stat->type = "symbolic";
+    wfile_stat->symlink = 1;
+  } else {
+    // This is the type returned from GetFileType -> FILE_TYPE_DISK
+    wfile_stat->type = "disk";
+  }
+}
+
+// Fills in the fields that GetFileAttributesExW can provide without opening
+// the file.
+void statFromAttributeData(const WIN32_FILE_ATTRIBUTE_DATA& attribute_data,
+                           WINDOWS_STAT* wfile_stat) {
+  wfile_stat->mode = "-1";
+  wfile_stat->symlink = 0;
+  setDiskFileType(attribute_data.dwFileAttributes, wfile_stat);
+  wfile_stat->attributes = getFileAttribStr(attribute_data.dwFileAttributes);
+
+  ULARGE_INTEGER size;
+  size.HighPart = attribute_data.nFileSizeHigh;
+  size.LowPart = attribute_data.nFileSizeLow;
+  wfile_stat->size = static_cast<LONGLONG>(size.QuadPart);
+
+  wfile_stat->atime = filetimeToUnixtime(attribute_data.ftLastAccessTime);
+  wfile_stat->mtime = filetimeToUnixtime(attribute_data.ftLastWriteTime);
+  wfile_stat->btime = filetimeToUnixtime(attribute_data.ftCreationTime);
+}
+
+Status statWithHandle(const fs::path& path,
+                      const std::wstring& wpath,
+                      bool is_directory,
+                      bool get_owner,
+                      WINDOWS_STAT* wfile_stat) {
   auto FLAGS_AND_ATTRIBUTES = FILE_ATTRIBUTE_ARCHIVE |
                               FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_HIDDEN |
                               FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_OFFLINE |
                               FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM |
                               FILE_ATTRIBUTE_TEMPORARY;
-  // NOTE: cannot call path.wstring(), in the event path was constructed from an
-  // std::string, in which case, internal fs::path conversion to wstring will be
-  // performed incorrectly.
 
-  if (PathIsDirectoryW(stringToWstring(path.string()).c_str())) {
+  if (is_directory) {
     FLAGS_AND_ATTRIBUTES |= FILE_FLAG_BACKUP_SEMANTICS;
   }
 
+  // Only metadata is read through this handle. Not asking for read data access
+  // keeps the open cheap: antivirus filters don't scan it, and it doesn't
+  // conflict with how other processes have the file open.
+  DWORD desired_access = FILE_READ_ATTRIBUTES;
+  if (get_owner) {
+    desired_access |= READ_CONTROL;
+  }
+
   // Get the handle of the file object.
-  auto file_handle = CreateFileW(stringToWstring(path.string()).c_str(),
-                                 GENERIC_READ,
+  auto file_handle = CreateFileW(wpath.c_str(),
+                                 desired_access,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
                                  nullptr,
                                  OPEN_EXISTING,
@@ -1872,40 +1927,46 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
 
   // Check GetLastError for CreateFile error code.
   if (file_handle == INVALID_HANDLE_VALUE) {
-    CloseHandle(file_handle);
     return Status(-1,
                   "CreateFile failed for " + path.string() + " with " +
                       std::to_string(GetLastError()));
   }
 
-  // Get the owner SID of the file.
-  PSID sid_owner = nullptr;
-  PSID gid_owner = nullptr;
-  PSECURITY_DESCRIPTOR security_descriptor = nullptr;
-  auto ret =
-      GetSecurityInfo(file_handle,
-                      SE_FILE_OBJECT,
-                      OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
-                      &sid_owner,
-                      &gid_owner,
-                      NULL,
-                      NULL,
-                      &security_descriptor);
+  auto close_handle =
+      scope_guard::create([file_handle]() { CloseHandle(file_handle); });
 
-  // Check GetLastError for GetSecurityInfo error condition.
-  if (ret != ERROR_SUCCESS) {
-    CloseHandle(file_handle);
-    return Status(-1,
-                  "GetSecurityInfo failed for " + path.string() + " with " +
-                      std::to_string(GetLastError()));
+  if (get_owner) {
+    // Get the owner SID of the file.
+    PSID sid_owner = nullptr;
+    PSID gid_owner = nullptr;
+    PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+    auto ret =
+        GetSecurityInfo(file_handle,
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+                        &sid_owner,
+                        &gid_owner,
+                        NULL,
+                        NULL,
+                        &security_descriptor);
+
+    // Check GetLastError for GetSecurityInfo error condition.
+    if (ret != ERROR_SUCCESS) {
+      return Status(-1,
+                    "GetSecurityInfo failed for " + path.string() + " with " +
+                        std::to_string(GetLastError()));
+    }
+
+    wfile_stat->uid = getRidFromSid(sid_owner);
+    wfile_stat->gid = getRidFromSid(gid_owner);
+
+    LocalFree(security_descriptor);
   }
 
   FILE_BASIC_INFO basic_info;
   BY_HANDLE_FILE_INFORMATION file_info;
 
   if (GetFileInformationByHandle(file_handle, &file_info) == 0) {
-    CloseHandle(file_handle);
-    LocalFree(security_descriptor);
     return Status(-1,
                   "GetFileInformationByHandle failed for " + path.string() +
                       " with " + std::to_string(GetLastError()));
@@ -1927,12 +1988,6 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
   // inode is the decimal equivalent of fileid
   wfile_stat->inode = file_index;
 
-  wfile_stat->uid = getRidFromSid(sid_owner);
-
-  wfile_stat->gid = getRidFromSid(gid_owner);
-
-  LocalFree(security_descriptor);
-
   // Permission bits don't make sense for Windows. Use ntfs_acl_permissions
   // table
   wfile_stat->mode = "-1";
@@ -1947,18 +2002,7 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
     break;
   }
   case FILE_TYPE_DISK: {
-    if ((file_info.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE) ||
-        (file_info.dwFileAttributes & FILE_ATTRIBUTE_NORMAL)) {
-      wfile_stat->type = "regular";
-    } else if (file_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      wfile_stat->type = "directory";
-    } else if (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-      wfile_stat->type = "symbolic";
-      wfile_stat->symlink = 1;
-    } else {
-      // This is the type returned from GetFileType -> FILE_TYPE_DISK
-      wfile_stat->type = "disk";
-    }
+    setDiskFileType(file_info.dwFileAttributes, wfile_stat);
     break;
   }
   case FILE_TYPE_PIPE: {
@@ -1986,51 +2030,94 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
   (GetFileSizeEx(file_handle, &li) == 0) ? wfile_stat->size = -1
                                          : wfile_stat->size = li.QuadPart;
 
-  const char* drive_letter = nullptr;
-  auto drive_letter_index = PathGetDriveNumberW(path.wstring().c_str());
-
-  if (drive_letter_index != -1 && kDriveLetters.count(drive_letter_index)) {
-    drive_letter = kDriveLetters.at(drive_letter_index).c_str();
-
-    unsigned long sect_per_cluster;
-    unsigned long bytes_per_sect;
-    unsigned long free_clusters;
-    unsigned long total_clusters;
-
-    if (GetDiskFreeSpaceA(drive_letter,
-                          &sect_per_cluster,
-                          &bytes_per_sect,
-                          &free_clusters,
-                          &total_clusters) != 0) {
-      wfile_stat->block_size = bytes_per_sect;
-    } else {
-      wfile_stat->block_size = -1;
-    }
-
-  } else {
-    wfile_stat->block_size = -1;
-  }
-
   wfile_stat->hard_links = file_info.nNumberOfLinks;
   wfile_stat->atime = filetimeToUnixtime(file_info.ftLastAccessTime);
   wfile_stat->mtime = filetimeToUnixtime(file_info.ftLastWriteTime);
   wfile_stat->btime = filetimeToUnixtime(file_info.ftCreationTime);
 
   // Change time is not available in GetFileInformationByHandle
-  ret = GetFileInformationByHandleEx(
+  auto ret = GetFileInformationByHandleEx(
       file_handle, FileBasicInfo, &basic_info, sizeof(basic_info));
 
   (!ret) ? wfile_stat->ctime = -1
          : wfile_stat->ctime = longIntToUnixtime(basic_info.ChangeTime);
 
-  windowsGetVersionInfo(wstringToString(path.wstring()),
-                        wfile_stat->product_version,
-                        wfile_stat->file_version);
+  return Status::success();
+}
 
-  windowsGetOriginalFilename(wstringToString(path.wstring()),
-                             wfile_stat->original_filename);
+} // namespace
 
-  CloseHandle(file_handle);
+Status platformStat(const fs::path& path,
+                    WINDOWS_STAT* wfile_stat,
+                    const WindowsStatFields& fields) {
+  // NOTE: cannot call path.wstring(), in the event path was constructed from an
+  // std::string, in which case, internal fs::path conversion to wstring will be
+  // performed incorrectly.
+  auto wpath = stringToWstring(path.string());
+
+  WIN32_FILE_ATTRIBUTE_DATA attribute_data;
+  bool have_attribute_data =
+      GetFileAttributesExW(
+          wpath.c_str(), GetFileExInfoStandard, &attribute_data) != 0;
+
+  // Without a handle, only plain files and directories can be described.
+  // Reparse points (symlinks, junctions, cloud files) are opened, so that
+  // their fields describe the target, as they always have.
+  bool need_handle =
+      fields.handle_info || fields.owner || !have_attribute_data ||
+      (attribute_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+      isDevicePath(wpath);
+
+  if (need_handle) {
+    bool is_directory =
+        have_attribute_data
+            ? (attribute_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            : PathIsDirectoryW(wpath.c_str()) != FALSE;
+
+    auto status =
+        statWithHandle(path, wpath, is_directory, fields.owner, wfile_stat);
+    if (!status.ok()) {
+      return status;
+    }
+  } else {
+    statFromAttributeData(attribute_data, wfile_stat);
+  }
+
+  if (fields.block_size) {
+    const char* drive_letter = nullptr;
+    auto drive_letter_index = PathGetDriveNumberW(path.wstring().c_str());
+
+    if (drive_letter_index != -1 && kDriveLetters.count(drive_letter_index)) {
+      drive_letter = kDriveLetters.at(drive_letter_index).c_str();
+
+      unsigned long sect_per_cluster;
+      unsigned long bytes_per_sect;
+      unsigned long free_clusters;
+      unsigned long total_clusters;
+
+      if (GetDiskFreeSpaceA(drive_letter,
+                            &sect_per_cluster,
+                            &bytes_per_sect,
+                            &free_clusters,
+                            &total_clusters) != 0) {
+        wfile_stat->block_size = bytes_per_sect;
+      } else {
+        wfile_stat->block_size = -1;
+      }
+
+    } else {
+      wfile_stat->block_size = -1;
+    }
+  }
+
+  if (fields.version_info) {
+    windowsGetVersionInfo(wstringToString(path.wstring()),
+                          wfile_stat->product_version,
+                          wfile_stat->file_version);
+
+    windowsGetOriginalFilename(wstringToString(path.wstring()),
+                               wfile_stat->original_filename);
+  }
 
   return Status::success();
 }

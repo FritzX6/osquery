@@ -144,6 +144,7 @@ function(generateOsqueryFilesystemTest)
   if (DEFINED PLATFORM_WINDOWS)
     list(APPEND source_files
       tests/windows/filesystem_tests.cpp
+      tests/windows/platform_stat_tests.cpp
     )
   endif()
 

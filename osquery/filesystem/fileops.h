@@ -74,20 +74,20 @@ const std::map<std::int32_t, std::string> kDriveLetters{
 typedef struct win_stat {
   std::string path;
   std::string filename;
-  int symlink;
+  int symlink{0};
   std::string file_id;
-  LONGLONG inode;
-  unsigned long uid;
-  unsigned long gid;
+  LONGLONG inode{-1};
+  unsigned long uid{0};
+  unsigned long gid{0};
   std::string mode;
-  LONGLONG device;
-  LONGLONG size;
-  int block_size;
-  LONGLONG atime;
-  LONGLONG mtime;
-  LONGLONG ctime;
-  LONGLONG btime;
-  int hard_links;
+  LONGLONG device{-1};
+  LONGLONG size{-1};
+  int block_size{-1};
+  LONGLONG atime{-1};
+  LONGLONG mtime{-1};
+  LONGLONG ctime{-1};
+  LONGLONG btime{-1};
+  int hard_links{-1};
   std::string type;
   std::string attributes;
   std::string volume_serial;
@@ -147,7 +147,40 @@ enum SeekMode { PF_SEEK_BEGIN = 0, PF_SEEK_CURRENT, PF_SEEK_END };
 #ifdef WIN32
 std::string getFileAttribStr(unsigned long);
 
-Status platformStat(const boost::filesystem::path&, WINDOWS_STAT*);
+/**
+ * @brief Parts of WINDOWS_STAT that platformStat can skip.
+ *
+ * Everything is collected by default. A caller that only needs some fields
+ * (the file table knows which columns a query uses) can turn parts off, so
+ * platformStat does less work per file.
+ */
+struct WindowsStatFields {
+  /// inode, file_id, ctime, hard_links, device and volume_serial.
+  /// These need an open handle to the file.
+  bool handle_info{true};
+
+  /// uid and gid. These need a handle with READ_CONTROL access.
+  bool owner{true};
+
+  /// block_size, read from the file's volume.
+  bool block_size{true};
+
+  /// product_version, file_version and original_filename, read from the
+  /// file's version resource.
+  bool version_info{true};
+};
+
+/**
+ * @brief Windows equivalent of stat().
+ *
+ * path, filename, symlink, mode, size, atime, mtime, btime, type and
+ * attributes are always filled in. When fields leaves out both handle_info
+ * and owner, these come from GetFileAttributesExW and the file is not opened,
+ * unless it is a reparse point.
+ */
+Status platformStat(const boost::filesystem::path&,
+                    WINDOWS_STAT*,
+                    const WindowsStatFields& fields = {});
 
 std::unique_ptr<BYTE[]> getCurrentUserInfo();
 
